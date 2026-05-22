@@ -1,4 +1,3 @@
-FILE 3 — README.md (Setup and Deployment Instructions)
 # Skin Disease Screening App
 ## ResNet-50 + BioBERT — Automated Skin Disease Screening
 ### CS 20/L Final Project | University of Mindanao

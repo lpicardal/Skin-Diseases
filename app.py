@@ -11,13 +11,13 @@ import torch.nn as nn
 import numpy as np
 from PIL import Image
 from torchvision import transforms, models
-from transformers import AutoTokenizer, AutoModel  # type: ignore
+from transformers import BertTokenizer, BertModel
 import json
 import os
 from pathlib import Path
-import matplotlib  # type: ignore
+import matplotlib.pyplot as plt
+import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt  # type: ignore
 
 # ── Page config (must be first Streamlit call) ──
 st.set_page_config(
@@ -289,20 +289,43 @@ class MultimodalFusionMLP(nn.Module):
 
 @st.cache_resource(show_spinner="Loading ResNet-50 feature extractor...")
 def load_resnet_extractor():
-    """Load frozen ResNet-50 backbone for visual feature extraction."""
-    extractor = models.resnet50(pretrained=False)
-    extractor.fc = nn.Identity()
+    """
+    Load frozen ResNet-50 backbone with ImageNet pretrained weights.
+    MUST match the weights used during feature extraction in Google Colab
+    (Cell: Feature Pre-Extraction — resnet50(pretrained=True)).
+    Random weights (pretrained=False) would produce meaningless feature
+    vectors and cause all predictions to collapse to Unknown/Normal.
+    """
+    try:
+        # torchvision >= 0.13 — use Weights enum (recommended)
+        extractor = models.resnet50(
+            weights=models.ResNet50_Weights.IMAGENET1K_V1
+        )
+    except AttributeError:
+        # torchvision < 0.13 — fall back to deprecated pretrained flag
+        extractor = models.resnet50(pretrained=True)
+
+    extractor.fc = nn.Identity()   # Remove FC head → 2048-d GAP output
     extractor.eval()
     for p in extractor.parameters():
-        p.requires_grad = False
+        p.requires_grad = False    # Frozen — no gradient updates
     return extractor
 
 
+# ── Updated constant ──
+BIOBERT_MODEL = 'dmis-lab/biobert-base-cased-v1.1'
+
 @st.cache_resource(show_spinner="Loading BioBERT encoder...")
 def load_biobert():
-    """Load BioBERT tokenizer and encoder."""
-    tokenizer = AutoTokenizer.from_pretrained(BIOBERT_MODEL)
-    model     = AutoModel.from_pretrained(BIOBERT_MODEL)
+    """
+    Load BioBERT using BertTokenizer and BertModel directly.
+    AutoTokenizer and AutoModel both fail on this checkpoint
+    because its config.json lacks a model_type key.
+    BioBERT is architecturally identical to BERT so the
+    specific Bert classes load it correctly.
+    """
+    tokenizer = BertTokenizer.from_pretrained(BIOBERT_MODEL)
+    model     = BertModel.from_pretrained(BIOBERT_MODEL)
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
@@ -312,14 +335,14 @@ def load_biobert():
 @st.cache_resource(show_spinner="Loading classification models...")
 def load_classification_models():
     """Load trained baseline and multimodal MLP checkpoints."""
-    baseline_path   = Path("models/best_baseline.pth")
-    multimodal_path = Path("models/best_multimodal.pth")
+    baseline_path   = Path("best_baseline.pth")
+    multimodal_path = Path("best_multimodal.pth")
 
     missing = []
     if not baseline_path.exists():
-        missing.append("models/best_baseline.pth")
+        missing.append("best_baseline.pth")
     if not multimodal_path.exists():
-        missing.append("models/best_multimodal.pth")
+        missing.append("best_multimodal.pth")
 
     if missing:
         return None, None, missing
@@ -343,12 +366,15 @@ def load_classification_models():
 def precompute_text_features(_tokenizer, _biobert_model):
     """
     Pre-extract BioBERT [CLS] embeddings for all 22 class descriptions.
-    Cached so this only runs once per session.
-    (Section 5.2.2 of documentation)
+    Uses BertTokenizer — runs once per session and is cached.
     """
     text_features = {}
+
     for class_name in CLASS_NAMES:
-        description = CLINICAL_DESCRIPTIONS.get(class_name, "Skin condition.")
+        description = CLINICAL_DESCRIPTIONS.get(
+            class_name, "Skin condition requiring medical evaluation."
+        )
+
         enc = _tokenizer(
             description,
             max_length=MAX_TEXT_LEN,
@@ -356,15 +382,16 @@ def precompute_text_features(_tokenizer, _biobert_model):
             truncation=True,
             return_tensors='pt'
         )
+
         with torch.no_grad():
-            out = _biobert_model(
-                input_ids=enc['input_ids'],
-                attention_mask=enc['attention_mask']
+            out    = _biobert_model(
+                input_ids      = enc['input_ids'],
+                attention_mask = enc['attention_mask']
             )
             cls_emb = out.last_hidden_state[:, 0, :].squeeze(0)
+
         text_features[class_name] = cls_emb
 
-    # Stack into (22, 768) matrix
     feat_matrix = torch.stack(
         [text_features[c] for c in CLASS_NAMES], dim=0
     )
@@ -379,7 +406,10 @@ def precompute_text_features(_tokenizer, _biobert_model):
 inference_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=IMG_MEAN, std=IMG_STD),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],   # ImageNet mean — must match training
+        std=[0.229, 0.224, 0.225]     # ImageNet std  — must match training
+    ),
 ])
 
 
@@ -392,55 +422,60 @@ def run_inference(pil_image, resnet_extractor, baseline_model,
                   multimodal_model, biobert_tokenizer, biobert_model,
                   text_feat_matrix):
     """
-    Full two-stage sequential pipeline:
-      Stage 1: Image → ResNet-50 extractor → visual features
-                     → BaselineMLP → Stage 1 prediction
-      Stage 2: BioBERT[predicted class] + visual features
-                     → MultimodalFusionMLP → final prediction + guidance
+    Full two-stage sequential pipeline (Section 4.3):
+      Stage 1 → ResNet-50 extractor → visual features → BaselineMLP → class prediction
+      Stage 2 → BioBERT[predicted class] + visual features → FusionMLP → final output
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── Preprocess image ──
-    img_tensor = inference_transform(pil_image).unsqueeze(0).to(device)
-
-    resnet_extractor  = resnet_extractor.to(device)
-    baseline_model    = baseline_model.to(device)
-    multimodal_model  = multimodal_model.to(device)
-    text_feat_matrix  = text_feat_matrix.to(device)
+    img_tensor       = inference_transform(pil_image).unsqueeze(0).to(device)
+    resnet_extractor = resnet_extractor.to(device)
+    baseline_model   = baseline_model.to(device)
+    multimodal_model = multimodal_model.to(device)
+    text_feat_matrix = text_feat_matrix.to(device)
 
     with torch.no_grad():
-        # ── Stage 1A: Visual feature extraction (ResNet-50 GAP → 2048-d) ──
-        vis_feat = resnet_extractor(img_tensor)              # (1, 2048)
+
+        # ── Stage 1A: Visual feature extraction ──
+        # ResNet-50 backbone (Identity FC) → (1, 2048)
+        vis_feat = resnet_extractor(img_tensor)          # shape: (1, 2048)
 
         # ── Stage 1B: Baseline visual classification ──
-        stage1_logits = baseline_model(vis_feat)             # (1, 22)
-        stage1_probs  = torch.softmax(stage1_logits, dim=1)  # (1, 22)
+        stage1_logits = baseline_model(vis_feat)         # shape: (1, 22)
+        stage1_probs  = torch.softmax(stage1_logits, dim=1)
         stage1_conf, stage1_idx = stage1_probs.max(dim=1)
-        stage1_pred   = CLASS_NAMES[stage1_idx.item()]
 
-        # ── Stage 2: BioBERT text feature for predicted class ──
-        txt_feat = text_feat_matrix[stage1_idx].unsqueeze(0) # (1, 768)
+        # .item() converts tensor index to Python int — avoids dimension mismatch
+        stage1_class_idx = stage1_idx.item()             # plain int: e.g. 0
+        stage1_pred      = CLASS_NAMES[stage1_class_idx]
+
+        # ── Stage 2: Retrieve BioBERT text feature for predicted class ──
+        # text_feat_matrix shape: (22, 768)
+        # Indexing with a plain int → (768,) then unsqueeze(0) → (1, 768)
+        txt_feat = text_feat_matrix[stage1_class_idx].unsqueeze(0)  # (1, 768)
 
         # ── Stage 2: Fusion classification ──
-        fusion_logits = multimodal_model(vis_feat, txt_feat)
+        # concat: (1, 2048) + (1, 768) → (1, 2816) → Dense(512) → (1, 22)
+        fusion_logits = multimodal_model(vis_feat, txt_feat)         # (1, 22)
         fusion_probs  = torch.softmax(fusion_logits, dim=1)
         fusion_conf, fusion_idx = fusion_probs.max(dim=1)
-        final_pred    = CLASS_NAMES[fusion_idx.item()]
-        final_conf    = fusion_conf.item()
 
-        # ── Top-5 predictions (multimodal) ──
+        final_class_idx = fusion_idx.item()              # plain int
+        final_pred      = CLASS_NAMES[final_class_idx]
+        final_conf      = fusion_conf.item()             # plain float
+
+        # ── Top-5 predictions ──
         top5_probs, top5_idx = fusion_probs.topk(5, dim=1)
         top5 = [
             (CLASS_NAMES[i.item()], p.item())
             for i, p in zip(top5_idx[0], top5_probs[0])
         ]
 
-    # ── Clinical guidance from BioBERT corpus ──
     guidance = CLINICAL_DESCRIPTIONS.get(
         final_pred, "Consult a board-certified dermatologist for evaluation."
     )
-    risk      = CLASS_RISK.get(final_pred, 'medium')
-    urgency   = URGENCY_ADVICE.get(risk, URGENCY_ADVICE['medium'])
+    risk    = CLASS_RISK.get(final_pred, 'medium')
+    urgency = URGENCY_ADVICE.get(risk, URGENCY_ADVICE['medium'])
 
     return {
         'final_prediction' : final_pred,
